@@ -1,0 +1,13 @@
+La inteligencia artificial aprende a partir de ejemplos.
+Un modelo de lenguaje observa texto y trata de predecir la palabra siguiente.
+Cada letra se convierte en un número, y cada número en un vector.
+Los vectores recorren capas que mezclan información entre posiciones.
+La atención decide qué partes del pasado son útiles para el presente.
+Después de muchas capas, el modelo asigna una puntuación a cada carácter posible.
+La puntuación más alta no siempre es la respuesta correcta, pero con entrenamiento el modelo mejora.
+El aprendizaje consiste en ajustar millones de números pequeños hasta que las predicciones se acercan al texto real.
+Este corpus es solo un ejemplo: sirve para construir el vocabulario y probar el modelo.
+La lengua española tiene tildes, como en «canción», «árbol» y «lápiz», y también signos de interrogación y exclamación: ¿qué es aprender? ¡Aprender es cambiar!
+Cuando el modelo todavía no ha entrenado, sus respuestas son casi aleatorias.
+Eso no es un error: es el punto de partida de todo aprendizaje.
+Primero se entiende el camino del texto a la predicción; después se aprende a recorrerlo mejor.
