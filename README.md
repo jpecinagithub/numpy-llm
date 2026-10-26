@@ -127,3 +127,15 @@ numpy-llm/
 La documentación detallada de cada componente está en
 `docs/fundamentos.md`, con intuición, ecuación, formas, código, ejemplo
 y errores habituales.
+
+## Visualizador educativo (MVP, Fases 0–1)
+
+Una web Vite + React que visualiza el modelo Python real (recorrido con
+formas, tokenizador y vocabulario, inspector de parámetros y
+generación). Es local: necesita el backend Python, no es una web
+estática. Instrucciones completas en `visualizer/README.md`:
+
+```bash
+.venv/bin/python visualizer/server.py
+cd visualizer/frontend && npm install && npm run dev
+```
