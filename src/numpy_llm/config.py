@@ -41,6 +41,11 @@ class ModelConfig:
     init_std: float = 0.02
     seed: int = 42
     vocab_size: int | None = None
+    # Dtype de todos los parámetros y activaciones. "float32" es el
+    # comportamiento de la fase 1; "float64" es obligatorio para las
+    # comprobaciones numéricas de gradientes (fase 2), porque ningún
+    # cast interno a float32 debe invalidarlas silenciosamente.
+    dtype: str = "float32"
 
     def __post_init__(self) -> None:
         """Valida la configuración en cuanto se construye."""
@@ -59,6 +64,8 @@ class ModelConfig:
                 raise ValueError(f"{name} debe ser un número positivo y finito, no {value!r}.")
         if not isinstance(self.seed, int) or isinstance(self.seed, bool):
             raise ValueError(f"seed debe ser un entero, no {self.seed!r}.")
+        if self.dtype not in ("float32", "float64"):
+            raise ValueError(f"dtype debe ser 'float32' o 'float64', no {self.dtype!r}.")
         if self.vocab_size is not None:
             if not isinstance(self.vocab_size, int) or isinstance(self.vocab_size, bool) or self.vocab_size <= 0:
                 raise ValueError(f"vocab_size debe ser un entero positivo, no {self.vocab_size!r}.")
@@ -83,7 +90,7 @@ class ModelConfig:
         """Reconstruye la configuración desde :meth:`to_dict`."""
         if not isinstance(data, dict):
             raise ValueError("La configuración guardada debe ser un objeto JSON.")
-        allowed = set(asdict(cls()).keys()) if False else {
+        allowed = {
             "context_length",
             "d_model",
             "n_heads",
@@ -93,11 +100,17 @@ class ModelConfig:
             "init_std",
             "seed",
             "vocab_size",
+            "dtype",
         }
         unknown = set(data) - allowed
         if unknown:
             raise ValueError(f"Campos desconocidos en la configuración: {sorted(unknown)}.")
-        missing = allowed - set(data)
+        # "dtype" es opcional por compatibilidad con configuraciones
+        # guardadas en la fase 1 (siempre float32); si falta, se usa
+        # el valor por defecto en lugar de rechazar el archivo.
+        missing = (allowed - {"dtype"}) - set(data)
         if missing:
             raise ValueError(f"Campos ausentes en la configuración: {sorted(missing)}.")
+        data = dict(data)
+        data.setdefault("dtype", "float32")
         return cls(**data)

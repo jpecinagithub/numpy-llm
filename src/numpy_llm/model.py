@@ -38,6 +38,7 @@ entrenar modelos grandes.
 from __future__ import annotations
 
 import numpy as np
+from dataclasses import replace
 
 from .config import ModelConfig
 from .layers import Embeddings, LayerNorm, Linear
@@ -45,7 +46,23 @@ from .transformer import TransformerBlock
 
 
 class TransformerLanguageModel:
-    """Pequeño modelo de lenguaje Transformer decoder-only."""
+    """Pequeño modelo de lenguaje Transformer decoder-only, con backward.
+
+    Reglas de la fase 2:
+    - ``forward`` no modifica parámetros.
+    - ``backward(dlogits)`` calcula y ACUMULA gradientes; no modifica
+      pesos. Recorre el modelo en orden inverso: proyección al
+      vocabulario -> LayerNorm final -> bloques (del último al primero)
+      -> embeddings de tokens y posiciones.
+    - ``zero_grad()`` pone a cero todos los gradientes.
+    - Solo ``optimizer.step`` modifica los parámetros, in-place.
+    - ``named_parameters()`` y ``named_gradients()`` usan exactamente
+      los mismos nombres; cada gradiente tiene la misma forma y dtype
+      que su parámetro, en un array separado, inicializado a cero.
+    - No se devuelve ningún gradiente de los identificadores enteros.
+    - Un gradiente legítimamente nulo (p. ej. ciertas simetrías del
+      softmax en algunos biases) no es por sí solo un error.
+    """
 
     def __init__(self, config: ModelConfig) -> None:
         if config.vocab_size is None:
@@ -55,10 +72,10 @@ class TransformerLanguageModel:
                 "crear el modelo."
             )
         self.config = config
-        # Generador explícito: no se usa el generador global de NumPy.
+        self.dtype = np.dtype(config.dtype)
         rng = np.random.default_rng(config.seed)
         self.embeddings = Embeddings(
-            config.vocab_size, config.context_length, config.d_model, rng, config.init_std
+            config.vocab_size, config.context_length, config.d_model, rng, config.init_std, self.dtype
         )
         self.blocks = [
             TransformerBlock(
@@ -68,19 +85,26 @@ class TransformerLanguageModel:
                 rng,
                 config.init_std,
                 config.layer_norm_eps,
+                self.dtype,
             )
             for _ in range(config.n_layers)
         ]
-        self.final_ln = LayerNorm(config.d_model, config.layer_norm_eps)
-        self.lm_head = Linear(config.d_model, config.vocab_size, rng, config.init_std)
+        self.final_ln = LayerNorm(config.d_model, config.layer_norm_eps, self.dtype)
+        self.lm_head = Linear(config.d_model, config.vocab_size, rng, config.init_std, self.dtype)
+        self._cache: dict | None = None
 
     def forward(
-        self, token_ids: np.ndarray, return_attention_weights: bool = False
+        self,
+        token_ids: np.ndarray,
+        retain_cache: bool = False,
+        return_attention_weights: bool = False,
     ) -> np.ndarray | tuple[np.ndarray, list[np.ndarray]]:
         """Calcula los logits para una entrada ``[B, T]``.
 
-        Valida forma, tipo entero, rango de tokens, B y T mayores que
-        cero y T dentro del contexto máximo. No modifica los parámetros.
+        Con ``retain_cache=False`` (inferencia) no crea ni sobrescribe
+        intermediarios de entrenamiento. Con ``retain_cache=True``,
+        un segundo forward pendiente produce un error explicativo.
+        No modifica los parámetros.
         """
         token_ids = np.asarray(token_ids)
         if token_ids.ndim != 2:
@@ -98,16 +122,60 @@ class TransformerLanguageModel:
                 f"T ({token_ids.shape[1]}) supera context_length "
                 f"({self.config.context_length})."
             )
-        hidden = self.embeddings.forward(token_ids)  # [B, T, D]
+        if retain_cache and self._cache is not None:
+            raise ValueError(
+                "TransformerLanguageModel: ya hay un forward de entrenamiento "
+                "pendiente. Llama a backward() o a clear_cache() antes de un "
+                "nuevo forward con retain_cache=True."
+            )
+        hidden = self.embeddings.forward(token_ids, retain_cache=retain_cache)
         all_weights: list[np.ndarray] = []
         for block in self.blocks:
-            hidden, weights = block.forward(hidden, return_attention_weights=True)
+            hidden, weights = block.forward(
+                hidden, retain_cache=retain_cache, return_attention_weights=True
+            )
             all_weights.append(weights)
-        hidden = self.final_ln.forward(hidden)  # [B, T, D]
-        logits = self.lm_head.forward(hidden)  # [B, T, V]
+        hidden = self.final_ln.forward(hidden, retain_cache=retain_cache)
+        logits = self.lm_head.forward(hidden, retain_cache=retain_cache)
+        if retain_cache:
+            self._cache = {"shape": logits.shape}
         if return_attention_weights:
             return logits, all_weights
         return logits
+
+    def backward(self, dlogits: np.ndarray) -> None:
+        """Acumula gradientes de todos los parámetros. Consume la caché."""
+        if self._cache is None:
+            raise ValueError(
+                "TransformerLanguageModel.backward() sin un forward válido "
+                "previo: ejecuta primero forward(..., retain_cache=True) y "
+                "no llames a backward dos veces sobre los mismos "
+                "intermediarios (se consumen tras el primer backward)."
+            )
+        self._cache = None
+        dlogits = np.asarray(dlogits)
+        d_hidden = self.lm_head.backward(dlogits)
+        d_hidden = self.final_ln.backward(d_hidden)
+        for block in reversed(self.blocks):
+            d_hidden = block.backward(d_hidden)
+        self.embeddings.backward(d_hidden)
+
+    def zero_grad(self) -> None:
+        """Pone a cero todos los buffers de gradiente."""
+        self.embeddings.zero_grad()
+        for block in self.blocks:
+            block.zero_grad()
+        self.final_ln.zero_grad()
+        self.lm_head.zero_grad()
+
+    def clear_cache(self) -> None:
+        """Libera todos los intermediarios de forward, sin tocar gradientes."""
+        self._cache = None
+        self.embeddings.clear_cache()
+        for block in self.blocks:
+            block.clear_cache()
+        self.final_ln.clear_cache()
+        self.lm_head.clear_cache()
 
     def named_parameters(self) -> list[tuple[str, np.ndarray]]:
         """Todos los parámetros con nombres únicos y estables."""
@@ -119,6 +187,58 @@ class TransformerLanguageModel:
         params += self.lm_head.named_parameters("lm_head")
         return params
 
+    def named_gradients(self) -> list[tuple[str, np.ndarray]]:
+        """Gradientes con exactamente los mismos nombres que los parámetros."""
+        grads: list[tuple[str, np.ndarray]] = []
+        grads += self.embeddings.named_gradients("embeddings")
+        for i, block in enumerate(self.blocks):
+            grads += block.named_gradients(f"blocks.{i}")
+        grads += self.final_ln.named_gradients("final_ln")
+        grads += self.lm_head.named_gradients("lm_head")
+        return grads
+
     def count_parameters(self) -> int:
         """Número total de parámetros, sumando el tamaño real de los arrays."""
         return int(sum(array.size for _, array in self.named_parameters()))
+
+    def to_dtype(self, dtype: np.dtype | str) -> "TransformerLanguageModel":
+        """Convierte TODOS los parámetros y gradientes al dtype indicado.
+
+        Sustituye los arrays de cada componente (los nombres y las
+        formas no cambian). Debe llamarse ANTES de crear un optimizador,
+        porque el optimizador conserva referencias a los arrays: tras
+        la conversión, esas referencias quedarían obsoletas. Devuelve
+        ``self`` para encadenar. También actualiza ``config.dtype``.
+        """
+        target = np.dtype(dtype)
+        if target not in (np.dtype(np.float32), np.dtype(np.float64)):
+            raise ValueError(f"dtype debe ser float32 o float64, no {target}.")
+        self.dtype = target
+        self.config = replace(self.config, dtype=str(target))
+        for component, names in (
+            (self.embeddings, ("token_embedding", "position_embedding")),
+            (self.final_ln, ("gamma", "beta")),
+            (self.lm_head, ("weight", "bias")),
+        ):
+            for name in names:
+                arr = getattr(component, name)
+                setattr(component, name, arr.astype(target, copy=True))
+                grad = getattr(component, "grad_" + name)
+                setattr(component, "grad_" + name, grad.astype(target, copy=True))
+        for block in self.blocks:
+            for layer in (block.ln1, block.ln2):
+                for name in ("gamma", "beta"):
+                    setattr(layer, name, getattr(layer, name).astype(target, copy=True))
+                    setattr(layer, "grad_" + name, getattr(layer, "grad_" + name).astype(target, copy=True))
+            for proj in (
+                block.attention.q_proj, block.attention.k_proj,
+                block.attention.v_proj, block.attention.out_proj,
+                block.feed_forward.fc1, block.feed_forward.fc2,
+            ):
+                for name in ("weight", "bias"):
+                    setattr(proj, name, getattr(proj, name).astype(target, copy=True))
+                    setattr(proj, "grad_" + name, getattr(proj, "grad_" + name).astype(target, copy=True))
+        return self
+
+    # Alias legible.
+    astype = to_dtype

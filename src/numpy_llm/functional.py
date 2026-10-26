@@ -75,6 +75,77 @@ def log_softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
     return shifted - log_sum_exp
 
 
+def softmax_backward(probs: np.ndarray, dprobs: np.ndarray) -> np.ndarray:
+    """Backward general de softmax, sin materializar el Jacobiano.
+
+    Si ``A = softmax(S)`` y llega ``dA``, entonces
+    ``dS = A * (dA - sum(dA * A, axis=-1, keepdims=True))``. El término
+    ``sum(dA * A)`` es el Jacobiano aplicado al gradiente entrante:
+    el Jacobiano es ``diag(A) - A A^T`` por fila, y multiplicarlo por
+    dA da exactamente esa expresión, sin construir ninguna matriz
+    T x T por fila. El eje de reducción coincide con el eje
+    normalizado en el forward.
+    """
+    probs = np.asarray(probs)
+    dprobs = np.asarray(dprobs)
+    if probs.shape != dprobs.shape:
+        raise ValueError(f"probs y dprobs deben tener la misma forma, no {probs.shape} y {dprobs.shape}.")
+    return probs * (dprobs - np.sum(dprobs * probs, axis=-1, keepdims=True))
+
+
+def cross_entropy_with_grad(
+    logits: np.ndarray, targets: np.ndarray
+) -> tuple[float, np.ndarray]:
+    """Entropía cruzada media y su gradiente respecto a los logits.
+
+    Derivación: con ``p = softmax(logits)`` y log-softmax estable,
+    ``loss = -sum(log_probs[target]) / M`` con ``M = B * T``. Derivando
+    el log-softmax, ``d loss / d logit_j = p_j - 1{j == target}`` en
+    cada posición, y el factor ``1/M`` aparece UNA sola vez, al dividir
+    la suma de la pérdida (y por tanto su gradiente) entre el número
+    total de objetivos. Por eso ninguna capa vuelve a dividir por B o
+    T: la normalización se aplica una sola vez, aquí.
+
+    Returns:
+        ``(loss, dlogits)`` con ``dlogits`` de la misma forma y dtype
+        que ``logits`` (una copia: nunca se modifican probabilidades
+        que se usen en otra parte). No se construye un one-hot
+        completo: se resta 1 mediante indexación en la posición del
+        token correcto. No se aplica temperatura ni top-k.
+    """
+    logits = np.asarray(logits)
+    targets = np.asarray(targets)
+    if logits.ndim != 3:
+        raise ValueError(f"logits debe tener forma [B, T, V], no {logits.shape}.")
+    batch, seq_len, vocab_size = logits.shape
+    if batch == 0 or seq_len == 0:
+        raise ValueError("logits no puede tener lote o secuencia de longitud cero.")
+    if targets.shape != (batch, seq_len):
+        raise ValueError(f"targets debe tener forma {(batch, seq_len)}, no {targets.shape}.")
+    if targets.dtype.kind not in "iu":
+        raise ValueError("targets debe contener enteros.")
+    if np.any(targets < 0) or np.any(targets >= vocab_size):
+        raise ValueError(f"Todos los objetivos deben estar en [0, {vocab_size}).")
+    # Cálculo en el dtype de los logits (float64 en gradcheck, float32
+    # en entrenamiento ordinario); la suma final se hace en float64.
+    log_probs = log_softmax(logits, axis=-1)
+    batch_index = np.arange(batch)[:, None]
+    time_index = np.arange(seq_len)[None, :]
+    selected = log_probs[batch_index, time_index, targets]
+    total = float(batch * seq_len)
+    loss = float(-np.sum(selected.astype(np.float64)) / total)
+    probs = softmax(logits, axis=-1)
+    dlogits = np.array(probs, copy=True)
+    dlogits[batch_index, time_index, targets] -= 1
+    dlogits = dlogits / total
+    # Conservar el dtype de entrada (para float32, la división por el
+    # escalar Python no cambia el dtype con NEP 50; se fuerza por
+    # seguridad sin alterar el valor en float64).
+    if dlogits.dtype != logits.dtype:
+        dlogits = dlogits.astype(logits.dtype, copy=False)
+    return loss, dlogits
+
+
 def cross_entropy_loss(logits: np.ndarray, targets: np.ndarray) -> float:
     """Entropía cruzada media: ``-mean(log_softmax(logits)[b, t, target])``.
 

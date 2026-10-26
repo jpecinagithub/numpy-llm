@@ -1,13 +1,25 @@
 """Interfaz de consola.
 
-Comandos::
+Comandos de la fase 1::
 
     python -m numpy_llm inspect --corpus data/ejemplo.txt --seed 42
     python -m numpy_llm generate --corpus data/ejemplo.txt --prompt "La inteligencia" --max-new-tokens 120 --temperature 1.0 --top-k 20 --seed 42
     python -m numpy_llm save --corpus data/ejemplo.txt --output artifacts/modelo_inicial --seed 42
     python -m numpy_llm generate --model-dir artifacts/modelo_inicial --prompt "La inteligencia" --max-new-tokens 120 --seed 42
 
-No hay comandos de entrenamiento: esta fase no entrena.
+Comandos de la fase 2 (entrenamiento)::
+
+    python -m numpy_llm gradcheck --scope all --seed 42
+    python -m numpy_llm trace-step --config configs/smoke.json --corpus data/ejemplo.txt
+    python -m numpy_llm train --config configs/smoke.json --corpus data/ejemplo.txt --outdir runs/smoke
+    python -m numpy_llm overfit --config configs/overfit.json --outdir runs/overfit
+    python -m numpy_llm train --config configs/demo.json --corpus data/ejemplo.txt --outdir runs/demo
+    python -m numpy_llm evaluate --checkpoint runs/demo/best.npz --corpus data/ejemplo.txt --split val --full
+    python -m numpy_llm resume --checkpoint runs/demo/last.npz --corpus data/ejemplo.txt
+    python -m numpy_llm generate --checkpoint runs/demo/best.npz --prompt "La inteligencia" --max-new-tokens 200 --temperature 0.8 --seed 42
+
+Todos los comandos se ejecutan desde la raíz del proyecto con
+``PYTHONPATH=src`` (el paquete no está instalado en el entorno).
 """
 
 from __future__ import annotations
@@ -18,13 +30,17 @@ from pathlib import Path
 
 import numpy as np
 
+from .checkpoint import load_checkpoint
 from .config import ModelConfig
-from .data import build_examples
+from .data import build_examples, corpus_sha256, sample_batch, split_corpus
+from .evaluation import evaluate_model, uniform_baseline, unigram_baseline
 from .functional import cross_entropy_loss
 from .generation import generate
+from .gradcheck import gradcheck_model
 from .model import TransformerLanguageModel
 from .serialization import load_model, save_model
 from .tokenizer import CharTokenizer
+from .training import Trainer, TrainingConfig, trace_step
 
 UNTRAINED_NOTICE = (
     "Aviso: este modelo NO está entrenado. Sus pesos son aleatorios, "
@@ -47,11 +63,196 @@ def _build_from_corpus(corpus_path: str, seed: int) -> tuple[TransformerLanguage
 
 
 def _load_model_or_corpus(args: argparse.Namespace) -> tuple[TransformerLanguageModel, CharTokenizer]:
+    if getattr(args, "checkpoint", None):
+        ckpt = load_checkpoint(args.checkpoint)
+        return ckpt.model, ckpt.tokenizer
     if getattr(args, "model_dir", None):
         return load_model(args.model_dir)
     if getattr(args, "corpus", None):
         return _build_from_corpus(args.corpus, args.seed)
-    raise ValueError("Debes indicar --model-dir o --corpus.")
+    raise ValueError("Debes indicar --checkpoint, --model-dir o --corpus.")
+
+
+def _load_json_config(path: str) -> tuple[ModelConfig, TrainingConfig]:
+    import json as _json
+
+    data = _json.loads(Path(path).read_text(encoding="utf-8"))
+    if "model" not in data or "training" not in data:
+        raise ValueError("La configuración debe tener las claves 'model' y 'training'.")
+    model_data = dict(data["model"])
+    model_data.pop("vocab_size", None)  # se fija con el vocabulario real
+    base_config = ModelConfig(**model_data)
+    training_config = TrainingConfig.from_dict(data["training"])
+    return base_config, training_config
+
+
+def _build_trainer(config_path: str, corpus_path: str, outdir: str | None) -> Trainer:
+    base_config, training_config = _load_json_config(config_path)
+    text = _load_corpus(corpus_path)
+    split = split_corpus(
+        text,
+        train_fraction=training_config.train_fraction,
+        sequence_length=training_config.sequence_length,
+    )
+    model_config = base_config.with_vocab_size(split.tokenizer.vocab_size)
+    model = TransformerLanguageModel(model_config)
+    return Trainer(model, split.tokenizer, split, training_config, outdir=outdir)
+
+
+def _print_eval(label: str, result: dict) -> None:
+    print(f"{label}: loss={result['mean_loss']:.4f} "
+          f"perplexity={result['perplexity']} "
+          f"accuracy={result['token_accuracy']:.4f} "
+          f"objetivos={result['total_targets']} cobertura={result.get('coverage', '?')}")
+
+
+def cmd_gradcheck(args: argparse.Namespace) -> int:
+    """Comprueba los gradientes del modelo diminuto de la especificación."""
+    if args.scope not in ("all", "fast", "model"):
+        raise ValueError(f"--scope debe ser 'all', 'fast' o 'model', no {args.scope!r}.")
+    config = ModelConfig(
+        context_length=8, d_model=4, n_heads=2, n_layers=1, d_ff=8,
+        seed=args.seed, dtype="float64",
+    ).with_vocab_size(5)
+    model = TransformerLanguageModel(config)
+    rng = np.random.default_rng(args.seed)
+    token_ids = rng.integers(0, 5, size=(2, 3)).astype(np.int64)
+    targets = rng.integers(0, 5, size=(2, 3)).astype(np.int64)
+    sample = None if args.scope == "all" else 3
+    report = gradcheck_model(model, token_ids, targets, sample_per_tensor=sample, seed=args.seed)
+    print(f"Gradcheck ({args.scope}): passed={report['passed']} "
+          f"componentes={report['checked_components']} "
+          f"error_abs_max={report['max_abs_error']:.3e} "
+          f"error_rel_max={report['max_rel_error']:.3e} "
+          f"(h={report['h']}, atol={report['atol']}, rtol={report['rtol']})")
+    if args.scope == "all":
+        for name, info in report["per_parameter"].items():
+            print(f"  {name}: {info['checked']} componentes, error_abs_max={info['max_abs_error']:.3e}")
+    if not report["passed"]:
+        for failure in report["failures"][:10]:
+            print(f"  FALLO: {failure}")
+        return 1
+    return 0
+
+
+def cmd_trace_step(args: argparse.Namespace) -> int:
+    """Diagnóstico de un forward+backward pequeño, sin actualizar pesos."""
+    trainer = _build_trainer(args.config, args.corpus, outdir=None)
+    assert trainer.split is not None
+    rng = np.random.default_rng(args.seed)
+    x, y = sample_batch(
+        trainer.split.train_tokens, 2, trainer.config.sequence_length, rng
+    )
+    result = trace_step(trainer.model, x, y)
+    print(f"Entrada: {result['input_shape']}  Logits: {result['logits_shape']}")
+    print(f"Pérdida: {result['loss']:.4f}  Todos finitos: {result['all_finite']}")
+    print("Norma de gradiente por grupo:")
+    for group, info in result["grad_norm_by_group"].items():
+        print(f"  {group}: {info['num_tensors']} tensores, norma={info['grad_norm']:.4f}")
+    print("Este diagnóstico no actualiza pesos.")
+    return 0
+
+
+def _print_train_summary(report: dict) -> None:
+    print(f"Actualizaciones completadas: {report['completed_updates']}")
+    print(f"Tokens objetivo procesados: {report['tokens_processed']}")
+    if report["initial_eval"]:
+        _print_eval("Evaluación inicial", report["initial_eval"])
+    if report["final_eval"]:
+        _print_eval("Evaluación final", report["final_eval"])
+    print(f"Mejor pérdida de validación: {report['best_val_loss']} (paso {report['best_step']})")
+    if report["baselines"]:
+        print(f"Baselines: {report['baselines']}")
+    print("Muestra antes:")
+    print(report["samples_before"])
+    print("Muestra después:")
+    print(report["samples_after"])
+
+
+def cmd_train(args: argparse.Namespace) -> int:
+    """Entrena con partición train/validation y guarda en outdir."""
+    trainer = _build_trainer(args.config, args.corpus, outdir=args.outdir)
+    report = trainer.run()
+    _print_train_summary(report)
+    print(f"Resultados en: {args.outdir}")
+    return 0
+
+
+def cmd_overfit(args: argparse.Namespace) -> int:
+    """Prueba de memorización: sobreajustar 'abcabc...' con lotes fijos."""
+    base_config, training_config = _load_json_config(args.config)
+    tokenizer = CharTokenizer.from_tokens(["<UNK>", "a", "b", "c"])
+    tokens = np.asarray(tokenizer.encode("abc" * 40), dtype=np.int64)
+    seq_len = training_config.sequence_length
+    # Lote fijo: B ejemplos con inicios 0..B-1 (un solo lote por update).
+    x = np.stack([tokens[s : s + seq_len] for s in range(training_config.batch_size)])
+    y = np.stack([tokens[s + 1 : s + seq_len + 1] for s in range(training_config.batch_size)])
+    fixed = [(x, y)]
+    model_config = base_config.with_vocab_size(tokenizer.vocab_size)
+    model = TransformerLanguageModel(model_config)
+    trainer = Trainer(
+        model, tokenizer, None, training_config, outdir=args.outdir,
+        fixed_batches=fixed, use_validation=False,
+    )
+    initial = trainer.evaluate_fixed_batches()
+    report = trainer.run()
+    final = report["final_eval"]
+    print(f"Pérdida inicial: {initial['mean_loss']:.4f}")
+    print(f"Pérdida final: {final['mean_loss']:.4f} "
+          f"({100.0 * final['mean_loss'] / initial['mean_loss']:.1f} % de la inicial)")
+    print(f"Exactitud final sobre el lote memorizado: {final['token_accuracy']:.4f}")
+    print(f"Actualizaciones: {report['completed_updates']}  Semilla: {training_config.seed}")
+    print("Muestra greedy después:")
+    print(report["greedy_after"])
+    ok_loss = final["mean_loss"] < 0.20 * initial["mean_loss"]
+    ok_acc = final["token_accuracy"] >= 0.95
+    print(f"Criterio pérdida final < 20 % inicial: {'SUPERADO' if ok_loss else 'NO SUPERADO'}")
+    print(f"Criterio exactitud >= 95 %: {'SUPERADO' if ok_acc else 'NO SUPERADO'}")
+    print(f"Resultados en: {args.outdir}")
+    return 0 if (ok_loss and ok_acc) else 1
+
+
+def cmd_evaluate(args: argparse.Namespace) -> int:
+    """Evalúa un checkpoint sobre train o val, completo o subconjunto fijo."""
+    text = _load_corpus(args.corpus)
+    ckpt = load_checkpoint(args.checkpoint, expected_corpus_sha256=corpus_sha256(text))
+    training_config = TrainingConfig.from_dict(ckpt.metadata["training_config"])
+    split = split_corpus(
+        text,
+        train_fraction=training_config.train_fraction,
+        sequence_length=training_config.sequence_length,
+    )
+    if split.tokenizer.tokens != ckpt.tokenizer.tokens:
+        raise ValueError("El vocabulario del checkpoint no coincide con el reconstruido.")
+    tokens = split.train_tokens if args.split == "train" else split.val_tokens
+    limit = None if args.full else 32
+    result = evaluate_model(
+        ckpt.model, tokens, training_config.sequence_length,
+        batch_size=training_config.batch_size, limit_windows=limit,
+    )
+    _print_eval(f"Evaluación {args.split} ({'completa' if args.full else 'subconjunto fijo de 32 ventanas'})", result)
+    print(f"Ventanas evaluadas: {result['evaluated_windows']} / {result['total_windows_available']} "
+          f" Tokens fuera: {result['leftover_tokens']}")
+    print(f"Baseline uniforme: {uniform_baseline(ckpt.tokenizer.vocab_size)}")
+    print(f"Baseline unigrama (train -> {args.split}): "
+          f"{unigram_baseline(split.train_tokens, tokens, ckpt.tokenizer.vocab_size)}")
+    return 0
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    """Reanuda un entrenamiento desde last.npz, con el mismo horizonte."""
+    text = _load_corpus(args.corpus)
+    trainer = Trainer.from_checkpoint(args.checkpoint, text, outdir=args.outdir)
+    if trainer.completed_updates >= trainer.config.total_updates:
+        print(f"El entrenamiento ya completó su objetivo "
+              f"({trainer.completed_updates}/{trainer.config.total_updates} actualizaciones). "
+              f"No se reinicia ni se extiende el scheduler.")
+        return 0
+    print(f"Reanudando desde la actualización {trainer.completed_updates} "
+          f"hasta {trainer.config.total_updates} (mismo horizonte del scheduler).")
+    report = trainer.run()
+    _print_train_summary(report)
+    return 0
 
 
 def _format_matrix(matrix: np.ndarray) -> str:
@@ -151,9 +352,12 @@ def cmd_inspect(args: argparse.Namespace) -> int:
 
 
 def cmd_generate(args: argparse.Namespace) -> int:
-    """Genera texto de forma autorregresiva con un modelo sin entrenar."""
+    """Genera texto de forma autorregresiva."""
     model, tokenizer = _load_model_or_corpus(args)
-    print(UNTRAINED_NOTICE)
+    if getattr(args, "checkpoint", None):
+        print(f"Modelo cargado desde checkpoint: {args.checkpoint}")
+    else:
+        print(UNTRAINED_NOTICE)
     prompt_ids = tokenizer.encode(args.prompt)
     rng = np.random.default_rng(args.seed)
     full_ids = generate(
@@ -195,7 +399,8 @@ def build_parser() -> argparse.ArgumentParser:
     inspect_parser.add_argument("--seed", type=int, default=42)
     inspect_parser.set_defaults(func=cmd_inspect)
 
-    generate_parser = subparsers.add_parser("generate", help="Genera texto con un modelo sin entrenar.")
+    generate_parser = subparsers.add_parser("generate", help="Genera texto con un modelo (checkpoint, model-dir o corpus).")
+    generate_parser.add_argument("--checkpoint", help="Checkpoint .npz de entrenamiento (fase 2).")
     generate_parser.add_argument("--corpus", help="Archivo de texto para construir el vocabulario.")
     generate_parser.add_argument("--model-dir", help="Directorio de un modelo guardado.")
     generate_parser.add_argument("--prompt", required=True)
@@ -210,6 +415,41 @@ def build_parser() -> argparse.ArgumentParser:
     save_parser.add_argument("--output", required=True)
     save_parser.add_argument("--seed", type=int, default=42)
     save_parser.set_defaults(func=cmd_save)
+
+    gradcheck_parser = subparsers.add_parser("gradcheck", help="Comprueba gradientes por diferencias finitas (float64).")
+    gradcheck_parser.add_argument("--scope", default="all", choices=["all", "fast", "model"])
+    gradcheck_parser.add_argument("--seed", type=int, default=42)
+    gradcheck_parser.set_defaults(func=cmd_gradcheck)
+
+    trace_parser = subparsers.add_parser("trace-step", help="Diagnóstico forward+backward sin actualizar pesos.")
+    trace_parser.add_argument("--config", required=True)
+    trace_parser.add_argument("--corpus", required=True)
+    trace_parser.add_argument("--seed", type=int, default=42)
+    trace_parser.set_defaults(func=cmd_trace_step)
+
+    train_parser = subparsers.add_parser("train", help="Entrena con partición train/validation.")
+    train_parser.add_argument("--config", required=True)
+    train_parser.add_argument("--corpus", required=True)
+    train_parser.add_argument("--outdir", required=True)
+    train_parser.set_defaults(func=cmd_train)
+
+    overfit_parser = subparsers.add_parser("overfit", help="Prueba de memorización sobre 'abcabc...'.")
+    overfit_parser.add_argument("--config", required=True)
+    overfit_parser.add_argument("--outdir", required=True)
+    overfit_parser.set_defaults(func=cmd_overfit)
+
+    evaluate_parser = subparsers.add_parser("evaluate", help="Evalúa un checkpoint sobre train o val.")
+    evaluate_parser.add_argument("--checkpoint", required=True)
+    evaluate_parser.add_argument("--corpus", required=True)
+    evaluate_parser.add_argument("--split", default="val", choices=["train", "val"])
+    evaluate_parser.add_argument("--full", action="store_true", help="Evalúa todas las ventanas (sin --full: subconjunto fijo de 32).")
+    evaluate_parser.set_defaults(func=cmd_evaluate)
+
+    resume_parser = subparsers.add_parser("resume", help="Reanuda un entrenamiento desde un checkpoint.")
+    resume_parser.add_argument("--checkpoint", required=True)
+    resume_parser.add_argument("--corpus", required=True)
+    resume_parser.add_argument("--outdir", help="Directorio de salida (por defecto, el del checkpoint).")
+    resume_parser.set_defaults(func=cmd_resume)
     return parser
 
 

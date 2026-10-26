@@ -1,5 +1,12 @@
 # Preparación conceptual de la segunda fase: entrenamiento
 
+> NOTA (fase 2 implementada el 2026-10-26): este documento era la
+> preparación conceptual previa. La implementación existe ahora en
+> `src/numpy_llm/` (backward, optimizadores, Trainer, checkpoints) y
+> está documentada en `docs/entrenamiento.md`, `docs/derivadas.md`,
+> `docs/experimentos.md` y `docs/problemas_frecuentes.md`. Lo que sigue
+> se conserva como contexto, no como estado actual del proyecto.
+
 > Este documento describe cómo se entrenaría el modelo más adelante.
 > **No implementa esa fase.** No hay aquí métodos `backward` vacíos,
 > optimizadores de ejemplo ni código de entrenamiento incompleto.
