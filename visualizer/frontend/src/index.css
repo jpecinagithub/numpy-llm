@@ -115,6 +115,50 @@ pre code {
   text-decoration: none;
 }
 
+.phase-banner {
+  border-radius: 14px;
+  padding: 20px 22px;
+  margin: 24px 0 6px;
+}
+
+.phase-banner h2 {
+  margin: 0 0 8px;
+}
+
+.phase-banner p {
+  margin: 0;
+}
+
+.phase-1 {
+  background: #eff6ff;
+  border: 2px solid #2563eb;
+}
+
+.phase-2 {
+  background: #ecfdf5;
+  border: 2px solid #059669;
+}
+
+.curve {
+  list-style: none;
+  padding: 0;
+}
+
+.curve li {
+  display: grid;
+  grid-template-columns: 90px 90px 1fr;
+  align-items: center;
+  gap: 10px;
+  margin: 8px 0;
+}
+
+.curve .bar {
+  display: block;
+  height: 12px;
+  background: #059669;
+  border-radius: 999px;
+}
+
 .card {
   background: #fff;
   border: 1px solid #e5e7eb;

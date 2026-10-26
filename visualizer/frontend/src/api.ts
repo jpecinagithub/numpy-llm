@@ -78,6 +78,47 @@ export function forward(text: string): Promise<ForwardResult> {
   return request<ForwardResult>("/api/forward", { text });
 }
 
+export interface LossDemoResult {
+  text: string;
+  input_token_ids: number[];
+  target_token_ids: number[];
+  input_text: string;
+  target_text: string;
+  loss: number;
+  perplexity: number;
+  token_accuracy: number;
+  predicted_token_ids: number[];
+  prob_correct: number[];
+  grad_norm_by_group: Record<string, number>;
+  grad_norm_total: number;
+  all_finite: boolean;
+}
+
+export interface TrainDemoResult {
+  task: string;
+  model: string;
+  optimizer: string;
+  updates: number;
+  loss_before: number;
+  loss_after: number;
+  accuracy_before: number;
+  accuracy_after: number;
+  loss_ratio: number | null;
+  curve: { update: number; loss_before_update: number }[];
+  greedy_before: string;
+  greedy_after: string;
+  prompt: string;
+  warning: string;
+}
+
+export function lossDemo(text: string): Promise<LossDemoResult> {
+  return request<LossDemoResult>("/api/loss-demo", { text });
+}
+
+export function trainDemo(updates: number): Promise<TrainDemoResult> {
+  return request<TrainDemoResult>("/api/train-demo", { updates });
+}
+
 export function generate(input: {
   prompt: string;
   max_new_tokens: number;

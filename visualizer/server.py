@@ -23,6 +23,12 @@ Endpoints:
     POST /api/forward   {"text": "..."}
     POST /api/generate  {"prompt": "...", "max_new_tokens": 30,
                          "temperature": 1.0, "top_k": 20, "seed": 42}
+    POST /api/loss-demo {"text": "..."}   (Fase 2: pérdida y gradiente
+        de UNA ventana, con un modelo nuevo sin entrenar; no modifica
+        el modelo principal del visualizador)
+    POST /api/train-demo {"updates": 60}  (Fase 2: mini-entrenamiento
+        real sobre "abcabc...", modelo diminuto aparte, con curva de
+        pérdida y generación greedy antes/después)
 """
 
 from __future__ import annotations
@@ -42,8 +48,10 @@ if str(SRC_DIR) not in sys.path:
 import numpy as np  # noqa: E402
 
 from numpy_llm.config import ModelConfig  # noqa: E402
+from numpy_llm.functional import cross_entropy_with_grad, softmax  # noqa: E402
 from numpy_llm.generation import generate  # noqa: E402
 from numpy_llm.model import TransformerLanguageModel  # noqa: E402
+from numpy_llm.optimizers import AdamW, clip_gradients  # noqa: E402
 from numpy_llm.tokenizer import CharTokenizer  # noqa: E402
 
 HOST = "127.0.0.1"
@@ -185,6 +193,159 @@ def generate_payload(data: dict) -> dict:
     }
 
 
+def _group_name(name: str) -> str:
+    """Agrupa un parámetro para mostrar su norma de gradiente."""
+    parts = name.split(".")
+    if parts[0] == "blocks":
+        return ".".join(parts[:2])  # blocks.0, blocks.1, ...
+    return parts[0]
+
+
+def loss_demo_payload(data: dict) -> dict:
+    """Pérdida y gradiente de UNA ventana, sin entrenar nada.
+
+    Se crea un modelo nuevo con la misma semilla que el principal, se
+    toma la primera ventana de 9 tokens del texto (x = 8 primeros,
+    y = 8 siguientes, teacher forcing) y se hace forward + backward.
+    El modelo principal del visualizador NO se toca: este laboratorio
+    mide, no entrena. Devuelve pérdida, perplexity, exactitud y la
+    norma del gradiente por grupo de parámetros, más la probabilidad
+    que el modelo (sin entrenar) asigna al token correcto en cada
+    posición, para que se vea qué significa "la pérdida es alta".
+    """
+    import math
+
+    text = data.get("text", "")
+    if not isinstance(text, str) or len(text) < 9:
+        raise ValueError("Escribe al menos 9 caracteres para formar una ventana de 9 tokens.")
+    token_ids = TOKENIZER.encode(text)[:9]
+    if len(token_ids) < 9:
+        raise ValueError("Se necesitan al menos 9 tokens.")
+    x = np.asarray([token_ids[:8]], dtype=np.int64)
+    y = np.asarray([token_ids[1:9]], dtype=np.int64)
+    model = TransformerLanguageModel(
+        ModelConfig(seed=DEFAULT_SEED).with_vocab_size(TOKENIZER.vocab_size)
+    )
+    model.zero_grad()
+    logits = model.forward(x, retain_cache=True)
+    assert isinstance(logits, np.ndarray)
+    loss, dlogits = cross_entropy_with_grad(logits, y)
+    model.backward(dlogits)
+    probs = softmax(logits.astype(np.float64), axis=-1)
+    predicted = logits.argmax(axis=-1)[0].tolist()
+    correct = y[0].tolist()
+    prob_correct = [float(probs[0, t, correct[t]]) for t in range(8)]
+    groups: dict[str, float] = {}
+    for name, grad in model.named_gradients():
+        groups[_group_name(name)] = groups.get(_group_name(name), 0.0) + float(
+            np.sum(grad.astype(np.float64) ** 2)
+        )
+    grad_norms = {name: float(np.sqrt(value)) for name, value in sorted(groups.items())}
+    total_norm = float(np.sqrt(sum(value for value in groups.values())))
+    accuracy = float(np.mean([p == c for p, c in zip(predicted, correct)]))
+    model.zero_grad()
+    model.clear_cache()
+    return {
+        "text": text[:9],
+        "input_token_ids": x[0].tolist(),
+        "target_token_ids": y[0].tolist(),
+        "input_text": TOKENIZER.decode(x[0].tolist()),
+        "target_text": TOKENIZER.decode(y[0].tolist()),
+        "loss": float(loss),
+        "perplexity": float(math.exp(loss)) if loss < 700 else float("inf"),
+        "token_accuracy": accuracy,
+        "predicted_token_ids": predicted,
+        "prob_correct": prob_correct,
+        "grad_norm_by_group": grad_norms,
+        "grad_norm_total": total_norm,
+        "all_finite": bool(np.all(np.isfinite(logits))),
+    }
+
+
+def _mini_decode(tokenizer: CharTokenizer, token_ids: list[int]) -> str:
+    """Decodifica mostrando <UNK> como �, para que se lea en pantalla."""
+    return "".join("�" if token_id == 0 else tokenizer.tokens[token_id] for token_id in token_ids)
+
+
+def train_demo_payload(data: dict) -> dict:
+    """Mini-entrenamiento real: memorizar "abcabc...".
+
+    Modelo diminuto aparte (D=16, H=2, L=1, F=32, vocabulario de solo
+    4 tokens: <UNK>, a, b, c), un único lote fijo de 8 posiciones y
+    AdamW con lr constante 3e-3, la configuración OVERFIT del repo
+    reducida a los pasos que pide el usuario. Es una PRUEBA DE
+    MEMORIZACIÓN, no una demostración de generalización: sirve para
+    comprobar que el sistema aprende, antes de entrenar con un corpus
+    real. No toca el modelo principal del visualizador.
+    """
+    updates = data.get("updates", 60)
+    if not isinstance(updates, int) or isinstance(updates, bool) or not 10 <= updates <= 300:
+        raise ValueError("updates debe ser un entero entre 10 y 300.")
+    tokenizer = CharTokenizer.from_tokens(["<UNK>", "a", "b", "c"])
+    config = ModelConfig(
+        context_length=8, d_model=16, n_heads=2, n_layers=1, d_ff=32, seed=42
+    ).with_vocab_size(tokenizer.vocab_size)
+    model = TransformerLanguageModel(config)
+    sequence = np.asarray([tokenizer.encode("abcabcabcabcabcabc")], dtype=np.int64)
+    x, y = sequence[:, :8], sequence[:, 1:9]
+
+    def evaluate() -> tuple[float, float]:
+        from numpy_llm.functional import cross_entropy_loss
+
+        logits = model.forward(x)
+        assert isinstance(logits, np.ndarray)
+        loss = cross_entropy_loss(logits, y)
+        accuracy = float(np.mean(logits.argmax(axis=-1) == y))
+        return float(loss), accuracy
+
+    def greedy_text() -> str:
+        full = generate(
+            model, [1, 2], 20, temperature=0.0, rng=np.random.default_rng(42)
+        )
+        return _mini_decode(tokenizer, full[2:])
+
+    loss_before, acc_before = evaluate()
+    greedy_before = greedy_text()
+    params = [
+        (name, param, grad)
+        for (name, param), (_, grad) in zip(model.named_parameters(), model.named_gradients())
+    ]
+    optimizer = AdamW(params, lr=3e-3, weight_decay=0.0)
+    curve: list[dict] = []
+    for step in range(updates):
+        model.zero_grad()
+        logits = model.forward(x, retain_cache=True)
+        assert isinstance(logits, np.ndarray)
+        loss, dlogits = cross_entropy_with_grad(logits, y)
+        model.backward(dlogits)
+        clip_gradients(model.named_gradients(), 1.0)
+        optimizer.step(3e-3)
+        if step % 10 == 0 or step == updates - 1:
+            curve.append({"update": step + 1, "loss_before_update": float(loss)})
+    loss_after, acc_after = evaluate()
+    greedy_after = greedy_text()
+    return {
+        "task": "Memorizar la secuencia abcabc... (un solo lote fijo, 8 posiciones)",
+        "model": "D=16, H=2, L=1, F=32, vocabulario de 4 tokens",
+        "optimizer": "AdamW, lr constante 3e-3, weight_decay 0, clipping 1.0",
+        "updates": updates,
+        "loss_before": loss_before,
+        "loss_after": loss_after,
+        "accuracy_before": acc_before,
+        "accuracy_after": acc_after,
+        "loss_ratio": (loss_after / loss_before) if loss_before else None,
+        "curve": curve,
+        "greedy_before": greedy_before,
+        "greedy_after": greedy_after,
+        "prompt": "abc",
+        "warning": (
+            "Prueba de memorización, no de generalización: el modelo solo "
+            "ha visto este lote. Que memorice no demuestra que entienda "
+            "texto nuevo."
+        ),
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     """Manejador JSON mínimo, solo para desarrollo local."""
 
@@ -250,6 +411,10 @@ class Handler(BaseHTTPRequestHandler):
                 payload = forward_payload(data.get("text", ""))
             elif path == "/api/generate":
                 payload = generate_payload(data)
+            elif path == "/api/loss-demo":
+                payload = loss_demo_payload(data)
+            elif path == "/api/train-demo":
+                payload = train_demo_payload(data)
             else:
                 self._send_json(404, {"error": f"Ruta desconocida: {path}"})
                 return
